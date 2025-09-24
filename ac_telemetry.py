@@ -21,8 +21,10 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from datetime import datetime
 
 # ----------------------------------------------------------------------
 # Optional deps: pygame (main window)
@@ -370,9 +372,12 @@ def _int(s: str, default: Union[int, float]) -> int:
         return int(s)
     except Exception:
         try:
-            return int(round(float(default)))
+            return int(round(float(s)))
         except Exception:
-            return 0
+            try:
+                return int(round(float(default)))
+            except Exception:
+                return 0
 
 
 def _float(s: str, default: float) -> float:
@@ -406,7 +411,7 @@ def load_map_ini(path: Path) -> Dict[str, float]:
     except Exception:
         pass
     return dict(w=float(vals["WIDTH"]), h=float(vals["HEIGHT"]), sx=float(vals["SCALE_FACTOR"]),
-                ox=float(vals["X_OFFSET"]), oz=float(vals["Z_OFFSET"]), invert_y=True)
+                ox=float(vals["X_OFFSET"]), oz=float(vals["Z_OFFSET"]), invert_y=False)
 
 
 def guess_ac_roots(cli_root: Optional[str]) -> List[Path]:
@@ -549,8 +554,9 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
             self.cv = canvas
             self.map_img_tk = None
             self.map_img_pil = None
-            self.map_w = 1
-            self.map_h = 1
+            self._view_img = None
+            self.map_w = 1.0
+            self.map_h = 1.0
             self.view_scale = 1.0
             self.view_dx = 0.0
             self.view_dy = 0.0
@@ -562,51 +568,167 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
             self.transform: Optional[Dict[str, float]] = None
             self.last_track = None
             self.last_cfg = None
+            self.base_w = 1.0
+            self.base_h = 1.0
+            self.scale_factor = 1.0
+            self.offset_x = 0.0
+            self.offset_z = 0.0
+            self.invert_y = False
+            self.center_on_car = False
+            self.center_offset: Tuple[float, float] = (0.5, 0.5)
+            self.last_car_pos: Optional[Tuple[float, float]] = None
+            self.min_scale = 0.05
+            self.max_scale = 12.0
 
             self.cv.bind("<Configure>", lambda e: self.fit_to_view(force=True))
+            self.cv.bind("<ButtonPress-1>", self._start_pan)
+            self.cv.bind("<B1-Motion>", self._do_pan)
+            self.cv.bind("<ButtonRelease-1>", self._stop_pan)
             self.cv.bind("<ButtonPress-2>", self._start_pan)
             self.cv.bind("<B2-Motion>", self._do_pan)
+            self.cv.bind("<ButtonRelease-2>", self._stop_pan)
             self.cv.bind("<MouseWheel>", self._zoom)
+            self.cv.bind("<Button-4>", self._zoom)
+            self.cv.bind("<Button-5>", self._zoom)
 
-        def _start_pan(self, e): self.pan_start = (e.x, e.y)
+        def _start_pan(self, e):
+            if self.center_on_car:
+                return 'break'
+            self.pan_start = (e.x, e.y)
+            return 'break'
 
         def _do_pan(self, e):
-            if not self.pan_start: return
+            if self.center_on_car or not self.pan_start:
+                return 'break'
             sx, sy = self.pan_start
             self.view_dx += (e.x - sx)
             self.view_dy += (e.y - sy)
             self.pan_start = (e.x, e.y)
             self.redraw()
+            return 'break'
+
+        def _stop_pan(self, _e):
+            self.pan_start = None
+            return 'break'
 
         def _zoom(self, e):
-            factor = 1.1 if e.delta > 0 else 0.9
+            delta = getattr(e, 'delta', 0)
+            if not delta and hasattr(e, 'num') and e.num in (4, 5):
+                delta = 120 if e.num == 4 else -120
+            if not delta:
+                return 'break'
+            factor = 1.1 if delta > 0 else 0.9
+            new_scale = max(self.min_scale, min(self.max_scale, self.view_scale * factor))
+            if self.center_on_car and self.last_car_pos:
+                self.view_scale = new_scale
+                self.recenter_on_car()
+                self.redraw()
+                return 'break'
             mx, my = e.x, e.y
             ix = (mx - self.view_dx) / (self.view_scale or 1.0)
             iy = (my - self.view_dy) / (self.view_scale or 1.0)
-            self.view_scale *= factor
+            self.view_scale = new_scale
             self.view_dx = mx - ix * self.view_scale
             self.view_dy = my - iy * self.view_scale
             self.redraw()
+            return 'break'
+
+        def _update_transform_cache(self):
+            if not self.transform:
+                self.scale_factor = 1.0
+                self.offset_x = 0.0
+                self.offset_z = 0.0
+                self.invert_y = False
+                self.base_w = float(self.map_w or 1.0)
+                self.base_h = float(self.map_h or 1.0)
+                return
+            try:
+                self.scale_factor = float(self.transform.get("sx", 1.0) or 1.0)
+            except Exception:
+                self.scale_factor = 1.0
+            if not math.isfinite(self.scale_factor) or abs(self.scale_factor) < 1e-6:
+                self.scale_factor = 1.0
+            try:
+                self.offset_x = float(self.transform.get("ox", 0.0) or 0.0)
+            except Exception:
+                self.offset_x = 0.0
+            try:
+                self.offset_z = float(self.transform.get("oz", 0.0) or 0.0)
+            except Exception:
+                self.offset_z = 0.0
+            inv_raw = self.transform.get("invert_y")
+            if isinstance(inv_raw, str):
+                inv_val = inv_raw.strip().lower()
+                self.invert_y = inv_val in {"1", "true", "yes", "on", "y"}
+            elif inv_raw is None:
+                self.invert_y = False
+            else:
+                self.invert_y = bool(inv_raw)
+            try:
+                self.base_w = float(self.transform.get("w", self.map_w) or self.map_w or 1.0)
+            except Exception:
+                self.base_w = float(self.map_w or 1.0)
+            try:
+                self.base_h = float(self.transform.get("h", self.map_h) or self.map_h or 1.0)
+            except Exception:
+                self.base_h = float(self.map_h or 1.0)
 
         def fit_to_view(self, force=False):
-            cw = self.cv.winfo_width()
-            ch = self.cv.winfo_height()
-            if cw <= 2 or ch <= 2: return
-            s = min(cw / max(1, self.map_w), ch / max(1, self.map_h))
+            cw = self.cv.winfo_width() or 0
+            ch = self.cv.winfo_height() or 0
+            if cw <= 2 or ch <= 2:
+                return
+            s = min(cw / max(1.0, self.map_w), ch / max(1.0, self.map_h))
+            s = max(self.min_scale, min(self.max_scale, s))
             self.view_scale = s
-            self.view_dx = (cw - self.map_w * s) / 2
-            self.view_dy = (ch - self.map_h * s) / 2
-            if force:
-                self.redraw()
+            if self.center_on_car and self.last_car_pos:
+                self.recenter_on_car()
+                if force:
+                    self.redraw()
+            else:
+                self.view_dx = (cw - self.map_w * s) / 2
+                self.view_dy = (ch - self.map_h * s) / 2
+                if force:
+                    self.redraw()
 
         def world_to_img(self, x: float, z: float) -> Tuple[float, float]:
-            T = self.transform
-            if not T: return x, z
-            px = T["ox"] + x * T["sx"]
-            py = T["oz"] + z * T["sx"]
-            if T.get("invert_y", True):
-                py = T["h"] - py
+            factor = self.scale_factor or 1.0
+            px = (x + self.offset_x) / factor
+            py = (z + self.offset_z) / factor
+            if self.invert_y:
+                base_h = self.base_h or self.map_h or 1.0
+                py = base_h - py
             return px, py
+
+        def set_center_mode(self, enabled: bool):
+            self.center_on_car = bool(enabled)
+            if self.center_on_car:
+                self.pan_start = None
+                self.recenter_on_car()
+
+        def set_center_offset(self, x: float, y: float):
+            self.center_offset = (float(x), float(y))
+            if self.center_on_car:
+                self.recenter_on_car()
+
+        def set_car_position(self, pos: Optional[Tuple[float, float]]):
+            self.last_car_pos = pos
+            if self.center_on_car:
+                self.recenter_on_car()
+
+        def reset_view(self):
+            self.fit_to_view(force=True)
+
+        def recenter_on_car(self):
+            if not self.center_on_car or not self.last_car_pos:
+                return
+            px, py = self.world_to_img(self.last_car_pos[0], self.last_car_pos[1])
+            cw = self.cv.winfo_width() or self.cv.winfo_reqwidth() or 0
+            ch = self.cv.winfo_height() or self.cv.winfo_reqheight() or 0
+            if cw <= 2 or ch <= 2:
+                return
+            self.view_dx = cw * self.center_offset[0] - px * self.view_scale
+            self.view_dy = ch * self.center_offset[1] - py * self.view_scale
 
         def load_assets_if_needed(self, track_name: Optional[str], track_cfg: Optional[str]) -> Optional[str]:
             changed = (track_name != self.last_track) or (track_cfg != self.last_cfg)
@@ -616,12 +738,13 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
 
             self.map_img_tk = None
             self.map_img_pil = None
-            self.map_w = self.map_h = 1
+            self._view_img = None
+            self.map_w = self.map_h = 1.0
             self.sideL_img = []
             self.sideR_img = []
             self.trail_img = []
+            self.last_car_pos = None
 
-            # find assets
             if manual_map and manual_map.exists():
                 self.track_assets = TrackAssets()
                 self.track_assets.base = manual_map.parent
@@ -630,8 +753,9 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
             else:
                 self.track_assets = find_track_assets(track_name, track_cfg, ac_roots)
             self.transform = (self.track_assets.transform if self.track_assets and self.track_assets.transform else None)
+            self._update_transform_cache()
 
-            status = "Карта: неизвестна"
+            status = "����: с������⭠"
             img_path = None
             if self.track_assets:
                 img_path = self.track_assets.map_png or self.track_assets.outline_png
@@ -640,22 +764,23 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
                 try:
                     if PIL_OK and Image is not None and ImageTk is not None:
                         self.map_img_pil = Image.open(img_path)
-                        self.map_w, self.map_h = self.map_img_pil.size
+                        self.map_w, self.map_h = [float(v) for v in self.map_img_pil.size]
                         self.map_img_tk = ImageTk.PhotoImage(self.map_img_pil)
                     else:
                         self.map_img_tk = tk.PhotoImage(file=str(img_path))
-                        self.map_w = self.map_img_tk.width()
-                        self.map_h = self.map_img_tk.height()
-                    status = f"Карта: {self.track_assets.base.name if self.track_assets and self.track_assets.base else '?'}"
+                        self.map_w = float(self.map_img_tk.width())
+                        self.map_h = float(self.map_img_tk.height())
+                    status = f"����: {self.track_assets.base.name if self.track_assets and self.track_assets.base else '?'}"
                 except Exception:
-                    status = "Карта: ошибка загрузки"
+                    status = "����: с訡�� с���㧪�"
             else:
                 if self.track_assets:
-                    status = "Карта: не найдена (рисую траекторию)"
+                    status = "����: с� с������ (���� сࠥ����)"
                 else:
-                    status = "Карта: неизвестна"
+                    status = "����: с������⭠"
 
-            # load side lines
+            self._update_transform_cache()
+
             if self.track_assets and self.track_assets.side_l and self.track_assets.side_r:
                 Lw = read_side_csv_points(self.track_assets.side_l)
                 Rw = read_side_csv_points(self.track_assets.side_r)
@@ -667,7 +792,6 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
 
         def redraw(self):
             self.cv.delete("all")
-            # background image
             if self.map_img_tk:
                 if PIL_OK and self.map_img_pil is not None and Image is not None and ImageTk is not None:
                     iw = int(max(1, min(8192, self.map_w * self.view_scale)))
@@ -678,20 +802,26 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
                 else:
                     self.cv.create_image(self.view_dx, self.view_dy, anchor="nw", image=self.map_img_tk)
             else:
-                w = self.cv.winfo_width(); h = self.cv.winfo_height()
-                self.cv.create_rectangle(10, 10, w - 10, h - 10, outline="#333")
+                w = self.cv.winfo_width() or 0
+                h = self.cv.winfo_height() or 0
+                self.cv.create_rectangle(10, 10, max(11, w - 10), max(11, h - 10), outline="#333")
 
             def draw_poly(pts, color="#ffcc00", width=2):
-                if not pts: return
-                L: List[float] = []
-                s = self.view_scale; dx = self.view_dx; dy = self.view_dy
+                if not pts:
+                    return
+                coords: List[float] = []
+                s = self.view_scale
+                dx = self.view_dx
+                dy = self.view_dy
                 for x, y in pts:
-                    L.extend([dx + x * s, dy + y * s])
-                if len(L) >= 4:
-                    self.cv.create_line(*L, fill=color, width=width, capstyle="round", joinstyle="round")
+                    coords.extend([dx + x * s, dy + y * s])
+                if len(coords) >= 4:
+                    self.cv.create_line(*coords, fill=color, width=width, capstyle="round", joinstyle="round")
 
-            if self.sideL_img: draw_poly(self.sideL_img, "#ffcc00", 2)
-            if self.sideR_img: draw_poly(self.sideR_img, "#ffcc00", 2)
+            if self.sideL_img:
+                draw_poly(self.sideL_img, "#ffcc00", 2)
+            if self.sideR_img:
+                draw_poly(self.sideR_img, "#ffcc00", 2)
             if self.trail_img:
                 draw_poly(self.trail_img, "#00e5ff", 2)
                 x, y = self.trail_img[-1]
@@ -699,10 +829,422 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
                 cy = self.view_dy + y * self.view_scale
                 self.cv.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline="#fff", fill="#ff0", width=2)
                 self.cv.create_text(cx + 10, cy - 10, text="YOU", fill="#fff", anchor="w")
+    class Snapshot:
+        __slots__ = ("ts", "data")
 
-    # ---- Build Tk UI (in this process main thread) ----
+        def __init__(self, ts: float, data: Dict[str, Any]):
+            self.ts = ts
+            self.data = data
+
+
+    class GraphCanvas:
+        def __init__(self, parent: Any, title: str, series: List[Dict[str, Any]], height: int = 160):
+            self.title = title
+            self.series = series
+            self.canvas = tk.Canvas(parent, height=height, bg="#111115", highlightthickness=0)
+            self.canvas.pack(fill="x", pady=(4, 4))
+            self.canvas.bind("<Configure>", lambda _e: self._render())
+            self._data: List[Snapshot] = []
+            self._highlight_ts: Optional[float] = None
+
+        def update(self, snapshots: List[Snapshot], highlight_ts: Optional[float] = None):
+            self._data = list(snapshots)
+            self._highlight_ts = highlight_ts
+            self._render()
+
+        def _render(self):
+            canvas = self.canvas
+            canvas.delete("all")
+            width = max(60, int(canvas.winfo_width() or canvas.winfo_reqwidth() or 320))
+            height = max(60, int(canvas.winfo_height() or canvas.winfo_reqheight() or 160))
+            pad_left, pad_right = 48, 16
+            pad_top, pad_bottom = 30, 30
+            x0 = pad_left
+            y0 = pad_top
+            x1 = width - pad_right
+            y1 = height - pad_bottom
+            if x1 <= x0:
+                x1 = x0 + 10
+            if y1 <= y0:
+                y1 = y0 + 10
+            canvas.create_rectangle(x0, y0, x1, y1, outline="#2b2b2b", width=1)
+            canvas.create_text(x0, 12, text=self.title, anchor="w", fill="#f0f0f0", font=("Segoe UI", 10, "bold"))
+            for i in range(1, 4):
+                gy = y0 + (y1 - y0) * i / 4
+                canvas.create_line(x0, gy, x1, gy, fill="#1d1d1d")
+            data = self._data
+            if len(data) < 2:
+                canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="No data", fill="#666666", font=("Segoe UI", 9))
+                return
+            times = [snap.ts for snap in data]
+            t0 = times[0]
+            t1 = times[-1]
+            if t1 - t0 < 1e-6:
+                t1 = t0 + 1.0
+            series_points: List[Tuple[str, str, List[Tuple[float, float]]]] = []
+            y_values: List[float] = []
+            for series in self.series:
+                color = series["color"]
+                name = series.get("name", "")
+                extractor = series["extract"]
+                pts: List[Tuple[float, float]] = []
+                for snap in data:
+                    val = extractor(snap.data)
+                    if val is None:
+                        continue
+                    try:
+                        val_f = float(val)
+                    except Exception:
+                        continue
+                    pts.append((snap.ts, val_f))
+                    y_values.append(val_f)
+                series_points.append((color, name, pts))
+            if not y_values:
+                canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="No values", fill="#666666", font=("Segoe UI", 9))
+                return
+            y_min = min(y_values)
+            y_max = max(y_values)
+            if math.isclose(y_min, y_max, rel_tol=1e-9):
+                delta = abs(y_min) * 0.1 or 1.0
+                y_min -= delta
+                y_max += delta
+            scale_x = (x1 - x0) / (t1 - t0)
+            scale_y = (y1 - y0) / (y_max - y_min)
+            legend_x = x0
+            legend_y = y0 - 14
+            for color, name, pts in series_points:
+                if not pts:
+                    continue
+                canvas.create_rectangle(legend_x, legend_y, legend_x + 10, legend_y + 10, outline=color, fill=color)
+                canvas.create_text(legend_x + 14, legend_y + 5, text=name, anchor="w", fill="#d8d8d8", font=("Segoe UI", 8))
+                legend_x += max(60, len(name) * 8)
+            fmt = "{:.2f}" if abs(y_max - y_min) < 100 else "{:.0f}"
+            canvas.create_text(x1 + 6, y0, text=fmt.format(y_max), anchor="nw", fill="#b0b0b0", font=("Segoe UI", 8))
+            canvas.create_text(x1 + 6, y1, text=fmt.format(y_min), anchor="sw", fill="#b0b0b0", font=("Segoe UI", 8))
+            canvas.create_text(x0, y1 + 12, text="0 с", anchor="nw", fill="#7a7a7a", font=("Segoe UI", 8))
+            canvas.create_text(x1, y1 + 12, text=f"{(t1 - t0):.1f} с", anchor="ne", fill="#7a7a7a", font=("Segoe UI", 8))
+            for color, _name, pts in series_points:
+                if not pts:
+                    continue
+                coords: List[float] = []
+                for ts, val in pts:
+                    x = x0 + (ts - t0) * scale_x
+                    y = y1 - (val - y_min) * scale_y
+                    coords.extend([x, y])
+                if len(coords) >= 4:
+                    canvas.create_line(*coords, fill=color, width=2, smooth=True)
+                elif len(coords) == 2:
+                    x, y = coords
+                    canvas.create_oval(x - 2, y - 2, x + 2, y + 2, outline=color, fill=color)
+            highlight_ts = self._highlight_ts
+            if highlight_ts is not None:
+                for color, _name, pts in reversed(series_points):
+                    if not pts:
+                        continue
+                    target = None
+                    for ts, val in reversed(pts):
+                        target = (ts, val)
+                        if ts <= highlight_ts:
+                            break
+                    if target is None:
+                        continue
+                    ts, val = target
+                    x = x0 + (ts - t0) * scale_x
+                    y = y1 - (val - y_min) * scale_y
+                    canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=2)
+                    break
+
+
+
+class GraphManager:
+    def __init__(self, parent: Any):
+        self.parent = parent
+        self.graphs: List[GraphCanvas] = []
+        self.window_seconds: float = 10.0
+
+    def set_window(self, seconds: float) -> None:
+        try:
+            self.window_seconds = max(0.1, float(seconds))
+        except Exception:
+            self.window_seconds = 10.0
+
+    def _trim_snapshots(self, snapshots: List[Snapshot]) -> List[Snapshot]:
+        if not snapshots:
+            return []
+        window = self.window_seconds
+        if window <= 0:
+            return list(snapshots)
+        t_end = snapshots[-1].ts
+        t_start = t_end - window
+        trimmed = [snap for snap in snapshots if snap.ts >= t_start]
+        if trimmed:
+            return trimmed
+        return [snapshots[-1]]
+
+    def build(self, configs: List[Dict[str, Any]]):
+        self.graphs.clear()
+        for cfg in configs:
+            graph = GraphCanvas(self.parent, cfg["title"], cfg["series"], cfg.get("height", 160))
+            self.graphs.append(graph)
+
+    def update(self, snapshots: List[Snapshot], highlight_ts: Optional[float]):
+        trimmed = self._trim_snapshots(snapshots)
+        for graph in self.graphs:
+            graph.update(trimmed, highlight_ts=highlight_ts)
+
+
+@dataclass
+class RecordingRun:
+    label: str
+    car: str
+    track: str
+    track_cfg: str
+    created_at: float
+    snapshots: List[Snapshot] = field(default_factory=list)
+
+
+class AdvancedStateController:
+    def __init__(
+        self,
+        root: Any,
+        mpanel: MapPanel,
+        lbl_title: Any,
+        lbl_map_status: Any,
+        set_label: Any,
+        graph_manager: GraphManager,
+        view_btn: Any,
+        record_btn: Any,
+        playback_btn: Any,
+        play_btn: Any,
+        prev_btn: Any,
+        next_btn: Any,
+        slider: Any,
+        time_label: Any,
+        cards_holder: Any,
+        graphs_holder: Any,
+        scroll_callback: Any,
+        records_var: Any,
+        records_cb: Any,
+        window_var: Any,
+        window_cb: Any,
+        window_choices: List[int],
+    ):
+        self.root = root
+        self.mpanel = mpanel
+        self.lbl_title = lbl_title
+        self.lbl_map_status = lbl_map_status
+        self.set_label = set_label
+        self.graph_manager = graph_manager
+        self.view_btn = view_btn
+        self.record_btn = record_btn
+        self.playback_btn = playback_btn
+        self.play_btn = play_btn
+        self.prev_btn = prev_btn
+        self.next_btn = next_btn
+        self.slider = slider
+        self.time_label = time_label
+        self.cards_holder = cards_holder
+        self.graphs_holder = graphs_holder
+        self.scroll_callback = scroll_callback
+        self.records_var = records_var
+        self.records_cb = records_cb
+        self.window_var = window_var
+        self.window_cb = window_cb
+        self.window_choices = sorted({int(v) for v in window_choices if v > 0}) or [10]
+        self.window_labels = [f"{sec} с" for sec in self.window_choices]
+        self.window_map = {label: float(sec) for label, sec in zip(self.window_labels, self.window_choices)}
+        self.graph_manager.set_window(self.window_choices[0])
+        self.window_cb.configure(state="readonly", values=self.window_labels)
+        default_label = next((label for label in self.window_labels if "10" in label), self.window_labels[0])
+        self.window_var.set(default_label)
+        self.window_cb.bind('<<ComboboxSelected>>', self._handle_window_change)
+
+        self.history: deque[Snapshot] = deque()
+        self.max_history_seconds = max(self.window_choices)
+        self.recordings: List[RecordingRun] = []
+        self.active_recording: Optional[RecordingRun] = None
+        self.playback_run: Optional[RecordingRun] = None
+        self.recording = False
+        self.view_mode = "cards"
+        self.play_mode = "live"
+        self.play_running = False
+        self.play_job: Optional[str] = None
+        self.slider_adjust = False
+        self.play_index = 0
+        self.latest_snapshot: Optional[Snapshot] = None
+
+        self.records_cb.configure(state="disabled")
+        self.records_cb.bind('<<ComboboxSelected>>', self._handle_recording_select)
+
+        self.view_btn.configure(command=self.toggle_view)
+        self.record_btn.configure(command=self.toggle_record)
+        self.playback_btn.configure(command=self.toggle_play_mode)
+        self.play_btn.configure(command=self.toggle_play)
+        self.prev_btn.configure(command=lambda: self.step_playback(-1))
+        self.next_btn.configure(command=lambda: self.step_playback(1))
+        self.slider.configure(command=self.on_slider_move)
+
+        self._show_cards()
+        self._set_play_controls_state(False)
+        self.playback_btn.state(["disabled"])
+        self._handle_window_change()
+        self.time_label.configure(text="LIVE")
+
+    def shutdown(self):
+        self.stop_play_loop()
+
+    def toggle_view(self):
+        if self.view_mode == "cards":
+            self._show_graphs()
+        else:
+            self._show_cards()
+
+    def _show_cards(self):
+        self.graphs_holder.pack_forget()
+        self.cards_holder.pack(fill="x", expand=True)
+        self.view_mode = "cards"
+        self.view_btn.configure(text="Показать графики")
+        self._fire_scroll_update()
+
+    def _show_graphs(self):
+        self.cards_holder.pack_forget()
+        self.graphs_holder.pack(fill="x", expand=True)
+        self.view_mode = "graphs"
+        self.view_btn.configure(text="Показать значения")
+        self._refresh_graphs()
+        self._fire_scroll_update()
+
+    def _fire_scroll_update(self):
+        try:
+            self.scroll_callback()
+        except Exception:
+            pass
+
+    def toggle_record(self):
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        base = self.latest_snapshot or (self.history[-1] if self.history else None)
+        car = base.data.get("carModel", "-") if base else "-"
+        track = base.data.get("track", "-") if base else "-"
+        cfg = base.data.get("trackConfig", "") if base else ""
+        created = time.time()
+        label = self._format_recording_label(created, car, track, cfg, 0.0)
+        self.active_recording = RecordingRun(label=label, car=car, track=track, track_cfg=cfg, created_at=created)
+        self.recording = True
+        self.play_mode = "live"
+        self.stop_play_loop()
+        self.record_btn.configure(text="Стоп запись")
+        self._set_play_controls_state(False)
+        self.playback_btn.configure(text="Режим воспроизведения")
+        self.playback_btn.state(["disabled"])
+
+    def stop_recording(self):
+        run = self.active_recording
+        self.recording = False
+        self.active_recording = None
+        self.record_btn.configure(text="Начать запись")
+        if run and run.snapshots:
+            duration = max(0.0, run.snapshots[-1].ts - run.snapshots[0].ts)
+            run.label = self._format_recording_label(run.created_at, run.car, run.track, run.track_cfg, duration)
+            self.recordings.append(run)
+            self._refresh_recordings_combo(select_index=len(self.recordings) - 1)
+        self._update_playback_button_state()
+
+    def toggle_play_mode(self):
+        if self.play_mode == "live":
+            self.set_play_mode("playback")
+        else:
+            self.set_play_mode("live")
+
+    def set_play_mode(self, mode: str):
+        if mode == self.play_mode:
+            return
+        if mode == "playback":
+            if not self.recordings:
+                return
+            if not self.playback_run:
+                self._refresh_recordings_combo(select_index=len(self.recordings) - 1)
+            if not self.playback_run or not self.playback_run.snapshots:
+                return
+            self.play_mode = "playback"
+            self.stop_play_loop()
+            self._set_play_controls_state(True)
+            self.playback_btn.configure(text="К живым данным")
+            self._update_slider_range()
+            self.slider_adjust = True
+            self.play_index = 0
+            self.slider.set(0)
+            self.slider_adjust = False
+            snap = self._snapshot_for_playback(self.play_index)
+            self.apply_snapshot(snap, highlight_ts=snap.ts, playback_index=self.play_index)
+        else:
+            self.play_mode = "live"
+            self.stop_play_loop()
+            self._set_play_controls_state(False)
+            self.playback_btn.configure(text="Режим воспроизведения")
+            self.time_label.configure(text="LIVE")
+            if self.latest_snapshot:
+                self.apply_snapshot(self.latest_snapshot, highlight_ts=self.latest_snapshot.ts)
+
+    def toggle_play(self):
+        snaps = self._current_playback_snapshots()
+        if self.play_mode != "playback" or not snaps:
+            return
+        if self.play_running:
+            self.stop_play_loop()
+        else:
+            self.play_running = True
+            self.play_btn.configure(text="Пауза")
+            self._schedule_next_frame()
+
+    def step_playback(self, step: int):
+        snaps = self._current_playback_snapshots()
+        if self.play_mode != "playback" or not snaps:
+            return
+        self.stop_play_loop()
+        new_idx = max(0, min(len(snaps) - 1, self.play_index + step))
+        if new_idx == self.play_index:
+            return
+        self.play_index = new_idx
+        self.slider_adjust = True
+        self.slider.set(self.play_index)
+        self.slider_adjust = False
+        snap = self._snapshot_for_playback(self.play_index)
+        self.apply_snapshot(snap, highlight_ts=snap.ts, playback_index=self.play_index)
+
+    def on_slider_move(self, value: str):
+        snaps = self._current_playback_snapshots()
+        if self.play_mode != "playback" or not snaps or self.slider_adjust:
+            return
+        try:
+            idx = int(float(value) + 0.5)
+        except Exception:
+            return
+        idx = max(0, min(len(snaps) - 1, idx))
+        if idx == self.play_index:
+            return
+        self.play_index = idx
+        snap = self._snapshot_for_playback(self.play_index)
+        self.apply_snapshot(snap, highlight_ts=snap.ts, playback_index=self.play_index)
+
+    def stop_play_loop(self):
+        if self.play_job is not None:
+            try:
+                self.root.after_cancel(self.play_job)
+            except Exception:
+                pass
+            self.play_job = None
+        if self.play_running:
+            self.play_running = False
+            self.play_btn.configure(text="Play")
+
+
     root = tk.Tk()
-    root.title("AC Telemetry — Advanced")
+    root.title("AC Telemetry - Advanced")
     root.geometry("1100x760+120+120")
     root.minsize(900, 600)
 
@@ -711,6 +1253,46 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
 
     left = ttk.Frame(outer)
     left.pack(side="left", fill="y", padx=(0, 8))
+
+    controls = ttk.Frame(left)
+    controls.pack(fill="x", pady=(0, 6))
+    controls.columnconfigure(0, weight=1)
+    controls.columnconfigure(1, weight=1)
+    controls.columnconfigure(2, weight=1)
+
+    view_btn = ttk.Button(controls, text="Показать графики")
+    view_btn.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+    record_btn = ttk.Button(controls, text="Начать запись")
+    record_btn.grid(row=0, column=1, padx=(0, 4), sticky="ew")
+    playback_btn = ttk.Button(controls, text="Режим воспроизведения")
+    playback_btn.grid(row=0, column=2, sticky="ew")
+
+    playback_controls = ttk.Frame(controls)
+    playback_controls.grid(row=1, column=0, columnspan=3, pady=(4, 0), sticky="ew")
+    playback_controls.columnconfigure(3, weight=1)
+
+    prev_btn = ttk.Button(playback_controls, text="<")
+    prev_btn.grid(row=0, column=0, padx=(0, 2))
+    play_btn = ttk.Button(playback_controls, text="Play")
+    play_btn.grid(row=0, column=1, padx=(0, 2))
+    next_btn = ttk.Button(playback_controls, text=">")
+    next_btn.grid(row=0, column=2, padx=(0, 6))
+    slider = ttk.Scale(playback_controls, from_=0, to=0, orient="horizontal")
+    slider.grid(row=0, column=3, sticky="ew")
+    time_label = ttk.Label(playback_controls, text="LIVE")
+    time_label.grid(row=0, column=4, padx=(6, 0))
+
+    ttk.Label(controls, text="Записи:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+    records_var = tk.StringVar()
+    records_cb = ttk.Combobox(controls, textvariable=records_var, state="disabled", width=34)
+    records_cb.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+
+    ttk.Label(controls, text="Окно графика:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+    window_var = tk.StringVar()
+    window_cb = ttk.Combobox(controls, textvariable=window_var, state="readonly", width=12)
+    window_cb.grid(row=3, column=1, sticky="w", pady=(4, 0))
+    window_choices = [5, 10, 20, 30, 60, 120]
+
     canvasL = tk.Canvas(left, bg="#0f0f10", highlightthickness=0, width=360)
     vsb = ttk.Scrollbar(left, orient="vertical", command=canvasL.yview)
     frm = ttk.Frame(canvasL)
@@ -729,15 +1311,28 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
 
     frm.bind("<Configure>", _on_conf)
     canvasL.bind("<Configure>", _on_conf)
-    canvasL.bind_all("<MouseWheel>", lambda e: canvasL.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+    def _scroll_cards(event):
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = event.delta
+        elif hasattr(event, "num") and event.num in (4, 5):
+            delta = 120 if event.num == 4 else -120
+        if delta:
+            canvasL.yview_scroll(int(-delta / 120), "units")
+        return "break"
+
+    canvasL.bind("<MouseWheel>", _scroll_cards)
+    canvasL.bind("<Button-4>", _scroll_cards)
+    canvasL.bind("<Button-5>", _scroll_cards)
 
     right = ttk.Frame(outer)
     right.pack(side="left", fill="both", expand=True)
     top = ttk.Frame(right)
     top.pack(fill="x")
-    lbl_title = ttk.Label(top, text="Car: —   Track: —", font=("Consolas", 12, "bold"))
+    lbl_title = ttk.Label(top, text="Car: -   Track: -", font=("Consolas", 12, "bold"))
     lbl_title.pack(side="left")
-    lbl_map_status = ttk.Label(top, text="Карта: поиск…")
+    lbl_map_status = ttk.Label(top, text="Карта: нет данных")
     lbl_map_status.pack(side="right")
 
     cv_map = tk.Canvas(right, bg="#0b0b0d", highlightthickness=0, cursor="fleur")
@@ -745,10 +1340,73 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
 
     mpanel = MapPanel(cv_map)
 
-    # Cards
+    map_controls = ttk.Frame(left)
+    map_controls.pack(fill="x", pady=(0, 6))
+    center_var = tk.BooleanVar(value=True)
+
+    def _toggle_center() -> None:
+        mpanel.set_center_mode(bool(center_var.get()))
+        mpanel.reset_view()
+
+    center_chk = ttk.Checkbutton(map_controls, text="Следовать за машиной", variable=center_var, command=_toggle_center)
+    center_chk.pack(side="left")
+    reset_btn = ttk.Button(map_controls, text="Сбросить вид", command=lambda: mpanel.reset_view())
+    reset_btn.pack(side="left", padx=(8, 0))
+    center_var.set(True)
+    _toggle_center()
+
+    cards_holder = ttk.Frame(frm)
+    cards_holder.pack(fill="x", expand=True)
+    graphs_holder = ttk.Frame(frm)
+
+    def value_getter(key: str, idx: Optional[int] = None):
+        def _inner(data: Dict[str, Any]):
+            value = data.get(key)
+            if idx is not None:
+                try:
+                    value = value[idx]
+                except Exception:
+                    return None
+            return value
+        return _inner
+
+    graph_configs = [
+        {
+            "title": "Скорость (km/h)",
+            "series": [
+                {"name": "Speed", "color": "#4fa3ff", "extract": value_getter("speedKmh")},
+            ],
+        },
+        {
+            "title": "Обороты двигателя",
+            "series": [
+                {"name": "RPM", "color": "#ffae4f", "extract": value_getter("rpm")},
+            ],
+        },
+        {
+            "title": "Педали",
+            "series": [
+                {"name": "Газ", "color": "#5ecb5e", "extract": value_getter("gas")},
+                {"name": "Тормоз", "color": "#ff6464", "extract": value_getter("brake")},
+            ],
+        },
+        {
+            "title": "Температура шин (°C)",
+            "series": [
+                {"name": "FL", "color": "#ff7070", "extract": value_getter("tyreCoreTemperature", 0)},
+                {"name": "FR", "color": "#ffb470", "extract": value_getter("tyreCoreTemperature", 1)},
+                {"name": "RL", "color": "#70baff", "extract": value_getter("tyreCoreTemperature", 2)},
+                {"name": "RR", "color": "#70ffac", "extract": value_getter("tyreCoreTemperature", 3)},
+            ],
+        },
+    ]
+
+    graph_manager = GraphManager(graphs_holder)
+    graph_manager.build(graph_configs)
+
     def card(title, keys_and_labels: List[Tuple[str, str]]) -> Dict[str, Any]:
         holder: Dict[str, Any] = {}
-        box = ttk.Frame(frm, padding=8)
+        box = ttk.Frame(cards_holder, padding=8)
         box.pack(fill="x", pady=(4, 4))
         box["borderwidth"] = 1
         box["relief"] = "solid"
@@ -756,7 +1414,7 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
         r = 1
         for key, label in keys_and_labels:
             ttk.Label(box, text=label).grid(row=r, column=0, sticky="w")
-            val = ttk.Label(box, text="—")
+            val = ttk.Label(box, text="-")
             val.grid(row=r, column=1, sticky="e")
             holder[key] = val
             r += 1
@@ -766,113 +1424,80 @@ def advanced_process_main(state_queue: "queue.Queue", ac_roots_list: List[str], 
 
     refs: Dict[str, ttk.Label] = {}
 
-    def reg(d: Dict[str, ttk.Label]): refs.update(d)
+    def reg(d: Dict[str, ttk.Label]):
+        refs.update(d)
 
-    reg(card("Сессия и машина", [
-        ("car", "Машина"),
+    reg(card("Авто и трасса", [
+        ("car", "Автомобиль"),
         ("track", "Трасса"),
-        ("lp", "Круг / Позиция"),
+        ("lp", "Круг / позиция"),
         ("sec", "Сектор"),
-        ("times", "Время (тек./прошл./лучший)"),
+        ("times", "Время (текущее/последнее/лучшее)"),
     ]))
-    reg(card("Шины и скорость колёс", [
-        ("tcore", "Темп. ядра FL/FR/RL/RR (°C)"),
+    reg(card("Шины и давление", [
+        ("tcore", "Темп. FL/FR/RL/RR (°C)"),
         ("press", "Давление FL/FR/RL/RR (bar/psi)"),
         ("wheelspeed", "Скорость колёс FL/FR/RL/RR (км/ч)"),
     ]))
-    reg(card("Подвеска и нагрузки", [
-        ("susp", "Ход подвески FL/FR/RL/RR (см)"),
-        ("ride", "Клиренс перед/зад (см)"),
+    reg(card("Подвеска и нагрузка", [
+        ("susp", "Ход подвески FL/FR/RL/RR (мм)"),
+        ("ride", "Клиренс перед/зад (мм)"),
         ("load", "Нагрузка FL/FR/RL/RR (кг)"),
     ]))
-    reg(card("Аэродинамика/электроника", [
+    reg(card("Системы и среда", [
         ("drs", "DRS"),
-        ("tc", "TC активность"),
-        ("abs", "ABS активность"),
+        ("tc", "TC уровень"),
+        ("abs", "ABS уровень"),
         ("airrho", "Плотность воздуха (кг/м³)"),
-        ("cgh", "Высота ЦТ (см)"),
-        ("grip", "Грип покрытия"),
+        ("cgh", "Центр тяжести (см)"),
+        ("grip", "Грипп покрытия"),
     ]))
     reg(card("Руль", [
-        ("steer", "Поворот руля (°)"),
+        ("steer", "Угол руля (°)"),
     ]))
-
-    latest: Dict[str, Any] = {}
 
     def set_lbl(key: str, text: str):
         lab = refs.get(key)
         if lab:
             lab.configure(text=text)
 
+    controller = AdvancedStateController(
+        root=root,
+        mpanel=mpanel,
+        lbl_title=lbl_title,
+        lbl_map_status=lbl_map_status,
+        set_label=set_lbl,
+        graph_manager=graph_manager,
+        view_btn=view_btn,
+        record_btn=record_btn,
+        playback_btn=playback_btn,
+        play_btn=play_btn,
+        prev_btn=prev_btn,
+        next_btn=next_btn,
+        slider=slider,
+        time_label=time_label,
+        cards_holder=cards_holder,
+        graphs_holder=graphs_holder,
+        scroll_callback=_on_conf,
+    )
+
     def poll_queue():
-        nonlocal latest
-        drained = False
         try:
             while True:
                 msg = state_queue.get_nowait()
                 if isinstance(msg, dict) and msg.get("cmd") == "exit":
+                    controller.shutdown()
                     root.destroy()
                     return
                 if isinstance(msg, dict) and msg.get("type") == "state":
-                    latest = msg.get("data", {})
-                    drained = True
+                    controller.on_new_state(msg.get("data", {}))
         except queue.Empty:
             pass
-
-        if drained and latest:
-            car = latest.get("carModel", "—")
-            track = latest.get("track", "—")
-            cfg = latest.get("trackConfig", "")
-            lbl_title.configure(text=f"Car: {car}   Track: {track}" + (f" [{cfg}]" if cfg else ""))
-
-            status = mpanel.load_assets_if_needed(track if track and track != "—" else None, cfg if cfg else None)
-            if status:
-                lbl_map_status.configure(text=status)
-
-            set_lbl("car", car)
-            set_lbl("track", track + (f" [{cfg}]" if cfg else ""))
-            set_lbl("lp", f"{latest.get('lap', 0)} / {latest.get('position', 0)}")
-            set_lbl("sec", f"{latest.get('sector', 0)}")
-            set_lbl("times", f"{latest.get('time_current','--:--.---')} / {latest.get('time_last','--:--.---')} / {latest.get('time_best','--:--.---')}")
-
-            tcore = latest.get("tyreCoreTemperature", [0, 0, 0, 0])
-            prspsi = latest.get("wheelsPressurePsi", [0, 0, 0, 0])
-            prsbar = [psi_to_bar(x) for x in prspsi]
-            wlin = latest.get("wheelLinearKmh", [0, 0, 0, 0])
-
-            set_lbl("tcore", " / ".join(f"{x:.1f}" for x in tcore))
-            set_lbl("press", " / ".join(f"{b:.2f}/{p:.1f}" for b, p in zip(prsbar, prspsi)))
-            set_lbl("wheelspeed", " / ".join(f"{v:.1f}" for v in wlin))
-
-            sus = latest.get("suspensionTravel", [0, 0, 0, 0])
-            rh = latest.get("rideHeight", [0, 0])
-            load = latest.get("wheelLoad", [0, 0, 0, 0])
-            set_lbl("susp", " / ".join(f"{x*100:.1f}" for x in sus))
-            set_lbl("ride", " / ".join(f"{x*100:.1f}" for x in rh))
-            set_lbl("load", " / ".join(f"{x/9.81:.0f}" for x in load))
-
-            set_lbl("drs", "ON" if latest.get("drs", 0) > 0.5 else "off")
-            set_lbl("tc", f"{latest.get('tc', 0):.2f}")
-            set_lbl("abs", f"{latest.get('abs', 0):.2f}")
-            set_lbl("airrho", f"{latest.get('airDensity', 0):.3f}")
-            set_lbl("cgh", f"{latest.get('cgHeight', 0)*100:.1f}")
-            set_lbl("grip", f"{latest.get('surfaceGrip', 0):.2f}")
-            set_lbl("steer", f"{latest.get('steerAngle', 0.0):+.1f}")
-
-            trail_world: List[Tuple[float, float]] = latest.get("trail", [])
-            if mpanel.transform and (mpanel.map_img_tk or mpanel.map_img_pil):
-                mpanel.trail_img = [mpanel.world_to_img(x, z) for (x, z) in trail_world]
-            else:
-                mpanel.trail_img = trail_world
-            mpanel.redraw()
-
         root.after(poll_ms, poll_queue)
 
     root.after(poll_ms, poll_queue)
-    root.protocol("WM_DELETE_WINDOW", lambda: (state_queue.put({"cmd": "exit"}), root.destroy()))
+    root.protocol("WM_DELETE_WINDOW", lambda: (state_queue.put({"cmd": "exit"}), controller.shutdown(), root.destroy()))
     root.mainloop()
-
-
 # ----------------------------------------------------------------------
 # Main program (pygame)
 # ----------------------------------------------------------------------
@@ -1022,8 +1647,12 @@ def main():
 
     def open_advanced():
         nonlocal adv_running, adv_q, adv_proc
-        if not adv_allowed or adv_running:
+        if not adv_allowed:
             return
+        if adv_running:
+            if adv_proc and adv_proc.is_alive():
+                return
+            close_advanced()
         adv_q = Queue(maxsize=2)
         adv_proc = Process(target=advanced_process_main,
                            args=(adv_q, [str(p) for p in ac_roots], manual_map, int(args.adv_poll_ms)),
@@ -1033,15 +1662,24 @@ def main():
 
     def close_advanced():
         nonlocal adv_running, adv_q, adv_proc
-        if adv_q:
+        q = adv_q
+        p = adv_proc
+        if q:
             try:
-                adv_q.put({"cmd": "exit"}, block=False)
+                q.put({"cmd": "exit"}, block=False)
             except Exception:
                 pass
-        if adv_proc:
-            adv_proc.join(timeout=1.0)
-            if adv_proc.is_alive():
-                adv_proc.terminate()
+        if p:
+            p.join(timeout=1.0)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=0.5)
+        if q:
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
         adv_proc = None
         adv_q = None
         adv_running = False
@@ -1078,6 +1716,8 @@ def main():
                             s.buf.clear()
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if adv_allowed and btn_rect.collidepoint(ev.pos):
+                    if adv_running and adv_proc and not adv_proc.is_alive():
+                        close_advanced()
                     if adv_running:
                         close_advanced()
                     else:
@@ -1130,7 +1770,9 @@ def main():
 
                     steer_deg = float(p.steerAngle)
 
-                    trail.append((float(g.carCoordinates[0]), float(g.carCoordinates[2])))
+                    car_x = float(g.carCoordinates[0])
+                    car_z = float(g.carCoordinates[2])
+                    trail.append((car_x, car_z))
 
                     if hasattr(s, "tyreRadius") and s.tyreRadius:
                         tyreR = [float(s.tyreRadius[i]) for i in range(4)]
@@ -1162,6 +1804,12 @@ def main():
                                 "airDensity": float(p.airDensity), "cgHeight": float(p.cgHeight),
                                 "surfaceGrip": float(g.surfaceGrip),
                                 "steerAngle": steer_deg,
+                                "timestamp": now,
+                                "speedKmh": float(speed_kmh_filt if speed_kmh_filt is not None else speed_kmh_raw),
+                                "rpm": rpm,
+                                "gas": gas,
+                                "brake": brake,
+                                "car_pos": [car_x, car_z],
                                 "trail": list(trail),
                             }
                         }
@@ -1310,9 +1958,7 @@ def main():
 
         # monitor advanced process state
         if adv_running and adv_proc and not adv_proc.is_alive():
-            adv_running = False
-            adv_q = None
-            adv_proc = None
+            close_advanced()
 
     # cleanup
     if csv_fh:
@@ -1328,3 +1974,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
